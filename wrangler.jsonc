@@ -1,0 +1,58 @@
+/**
+ * Cofferdam Self attester Worker — Cloudflare config.
+ *
+ * Holds the SelfAttester ECDSA private key as a Cloudflare-managed
+ * secret and signs bind messages on demand. Strictly service-binding
+ * only — `workers_dev: false` and zero `routes`. The only callers are
+ * `cofferdam-api` (today) and `cofferdam-prover` (Sessions 4-5),
+ * both bound via `services` in their respective wrangler.jsonc.
+ *
+ * Schema reference: https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cofferdam-attester",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-30",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Observability — tail-able logs are the audit trail for every
+  // sign event. Free tier, 7-day retention; Logpush in production.
+  "observability": {
+    "enabled": true
+  },
+
+  // ── PRIVATE WORKER ──────────────────────────────────────────────
+  // No public *.workers.dev URL. No routes. The only way to invoke
+  // this Worker is via the `services` binding from another Worker
+  // in the same Cloudflare account. Belt-and-suspenders defense for
+  // the attester key — even a compromised cofferdam-api can only
+  // call the exposed RPC method, never extract the secret.
+  "workers_dev": false,
+
+  // Variables — non-secret. Pinned so the attester refuses to sign
+  // for the wrong NullifierRegistry / chain (defense against an
+  // attacker tricking the attester into signing a hash bound to a
+  // different registry on a different chain).
+  "vars": {
+    "ENVIRONMENT": "development",
+
+    // ZKSync Era Sepolia chain id. Hardcoded into the message-hash
+    // preimage; if mainnet ever lights up we deploy a separate
+    // attester Worker (cofferdam-attester-mainnet) instead of
+    // multiplexing across chains in a single signer.
+    "ZKSYNC_SEPOLIA_CHAIN_ID": "300",
+
+    // Sole NullifierRegistry the attester is willing to sign for.
+    // Single-element allowlist for α; on rotation, deploy a new
+    // attester Worker pointing at the new registry, then flip the
+    // SelfAttesterRegistry trust set on-chain.
+    // Mirrors cofferdam-app/backend/cofferdam-api/src/chain/deployments.ts.
+    "NULLIFIER_REGISTRY_ADDRESS": "0x49b1E58fAdfA287Ed59299DC14D298b8fdf3d3ba"
+  }
+
+  // Secrets — set via `wrangler secret put`. NOT in this file.
+  //   ATTESTER_PRIVATE_KEY  — 0x-prefixed 32-byte secp256k1 key.
+  //                           Recover address: 0x... (must match the
+  //                           address registered in SelfAttesterRegistry).
+}
