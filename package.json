@@ -4,6 +4,16 @@
   "private": true,
   "type": "module",
   "description": "Cofferdam Self attester Worker — holds the registered SelfAttester ECDSA key as a Cloudflare-managed secret, signs bind messages over Workers RPC. Service-binding only, no public URL.",
+  "license": "Apache-2.0",
+  "author": "OffshoreSync LLC",
+  "homepage": "https://github.com/OffshoreSync/cofferdam-attester#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OffshoreSync/cofferdam-attester.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OffshoreSync/cofferdam-attester/issues"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

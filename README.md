@@ -1,14 +1,18 @@
 # cofferdam-attester
 
-> **Session 3 — implemented 2026-05-31.**
-> Service-binding only Worker that signs `NullifierRegistry.attesterMessageHash`
-> with the registered `SelfAttester` ECDSA key. See
-> `../../progress.txt` for the multi-session execution log.
+> Service-binding-only Worker that signs `NullifierRegistry.attesterMessageHash`
+> with the registered `SelfAttester` ECDSA key. Part of the
+> [Cofferdam](https://cofferdam.xyz) wallet stack.
 
-The Cofferdam attester Worker holds the registered `SelfAttester` ECDSA
-key as a Cloudflare-managed secret and signs bind messages emitted by
-`cofferdam-prover`. It is never publicly reachable — accessed only via
-service-binding from `cofferdam-api` and `cofferdam-prover`.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+The Cofferdam attester Worker holds the registered `SelfAttester` ECDSA key as
+a Cloudflare-managed secret and signs bind messages emitted by
+[`cofferdam-prover`](https://github.com/OffshoreSync/cofferdam-prover). It is
+never publicly reachable — accessed only via service-binding from
+[`cofferdam-api`](https://github.com/OffshoreSync/cofferdam-api) and
+`cofferdam-prover`. Trust model is documented in
+[cofferdam-sdk/IDENTITY_LAYER_DESIGN.md](https://github.com/OffshoreSync/cofferdam-sdk/blob/main/IDENTITY_LAYER_DESIGN.md).
 
 ## Public RPC surface
 
@@ -100,3 +104,16 @@ curl -sX POST https://cofferdam-api.<subdomain>.workers.dev/v1/attester/test-sig
   TEE-attested key (Phase γ) is a single-Worker swap — the
   `SelfAttesterRegistry.addAttester` rotation primitive makes the
   migration contract-free per `IDENTITY_LAYER_DESIGN.md` §8.
+
+## Sibling repositories
+
+| Repo                                                                 | Role                                          |
+|----------------------------------------------------------------------|-----------------------------------------------|
+| [`cofferdam-api`](https://github.com/OffshoreSync/cofferdam-api)     | Public-edge HTTP Worker; consumes this RPC    |
+| [`cofferdam-prover`](https://github.com/OffshoreSync/cofferdam-prover) | Self.xyz Groth16 prover Container (WIP)     |
+| [`cofferdam-sdk`](https://github.com/OffshoreSync/cofferdam-sdk)     | Public SDK + identity-layer design doc        |
+| [`contracts`](https://github.com/OffshoreSync/contracts)             | Solidity contracts (Self.xyz integration)     |
+
+## License
+
+[Apache License 2.0](LICENSE). Copyright 2026 OffshoreSync LLC.

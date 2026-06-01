@@ -1,3 +1,6 @@
+// Copyright (c) 2026 OffshoreSync LLC
+// SPDX-License-Identifier: Apache-2.0
+
 /**
  * Pure crypto module for the Self attester.
  *

@@ -1,0 +1,17 @@
+cofferdam-attester
+Copyright 2026 OffshoreSync LLC
+
+This product includes software developed at OffshoreSync LLC
+(https://offshoresync.com).
+
+cofferdam-attester is the Self.xyz attester signing Worker for the
+Cofferdam wallet stack. It holds the registered SelfAttester ECDSA
+key as a Cloudflare-managed secret and signs bind messages over
+Workers RPC. It is part of the Cofferdam identity rail described in:
+  https://github.com/OffshoreSync/cofferdam-sdk/blob/main/IDENTITY_LAYER_DESIGN.md
+
+Sibling repositories:
+  cofferdam-api       https://github.com/OffshoreSync/cofferdam-api
+  cofferdam-prover    https://github.com/OffshoreSync/cofferdam-prover
+  cofferdam-sdk       https://github.com/OffshoreSync/cofferdam-sdk
+  contracts           https://github.com/OffshoreSync/contracts
