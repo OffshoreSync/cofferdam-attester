@@ -47,12 +47,27 @@
     // Single-element allowlist for α; on rotation, deploy a new
     // attester Worker pointing at the new registry, then flip the
     // SelfAttesterRegistry trust set on-chain.
-    // Mirrors cofferdam-app/backend/cofferdam-api/src/chain/deployments.ts.
-    "NULLIFIER_REGISTRY_ADDRESS": "0x49b1E58fAdfA287Ed59299DC14D298b8fdf3d3ba"
+    // Mirrors cofferdam-api/src/chain/deployments.ts.
+    "NULLIFIER_REGISTRY_ADDRESS": "0x8b26DE05470961DE31691bCBdE3de8A3572F8AdC",
+
+    // ── JWT issuance (Session 4 NEW — for cofferdam-prover) ─────
+    // The `issueProverSession` RPC returns a short-lived HS256 JWT
+    // that the cofferdam-prover Worker verifies locally with the same
+    // shared secret. iss/aud values must match cofferdam-prover's
+    // own JWT_ISSUER/JWT_AUDIENCE vars; TTL controls replay window.
+    "JWT_ISSUER": "cofferdam-attester",
+    "JWT_AUDIENCE": "cofferdam-prover",
+    "PROVER_SESSION_TTL_SECONDS": "60"
   }
 
   // Secrets — set via `wrangler secret put`. NOT in this file.
   //   ATTESTER_PRIVATE_KEY  — 0x-prefixed 32-byte secp256k1 key.
   //                           Recover address: 0x... (must match the
   //                           address registered in SelfAttesterRegistry).
+  //   JWT_SHARED_SECRET     — ≥32 bytes of base64url-encoded random
+  //                           bytes; MUST equal the same-named secret
+  //                           in cofferdam-prover. Provision via:
+  //                             openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+  //                             wrangler secret put JWT_SHARED_SECRET
+  //                           (run in both Workers' repos).
 }

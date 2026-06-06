@@ -21,6 +21,7 @@
     "cf-typegen": "wrangler types"
   },
   "dependencies": {
+    "jose": "5.9.6",
     "viem": "2.51.3"
   },
   "devDependencies": {

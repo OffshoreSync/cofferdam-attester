@@ -25,9 +25,16 @@
  */
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
+import { SignJWT } from 'jose';
 import { getAddress, isAddress, isHex, type Hex } from 'viem';
 import type { Env } from './env.js';
-import type { AttesterRpc, SignBindRequest, SignBindResponse } from './rpc.js';
+import type {
+  AttesterRpc,
+  IssueProverSessionRequest,
+  IssueProverSessionResponse,
+  SignBindRequest,
+  SignBindResponse,
+} from './rpc.js';
 import { signBindAttestation } from './sign.js';
 
 // ────────────────────────────────────────────────────────────────────
@@ -222,6 +229,129 @@ export default class CofferdamAttester
       chainId: chainIdStr,
       registry: requestedRegistry,
       account: requestedAccount,
+    };
+  }
+
+  /**
+   * Issue a short-lived JWT pairing a prover request to a specific
+   * (account, registry) combo.
+   *
+   * The cofferdam-prover Worker verifies this JWT locally via the
+   * same HS256 shared secret and rejects any /v1/prove call whose
+   * Authorization header doesn't carry a valid, unexpired token
+   * with matching claims.
+   *
+   * Hot-path constraints:
+   *   - No on-chain reads. The registry-allowlist gate is the same
+   *     deploy-time constant the `signBind` path uses.
+   *   - No ATTESTER_PRIVATE_KEY access. JWT signing uses
+   *     JWT_SHARED_SECRET; the ECDSA key stays cold on this code path.
+   *   - Audit-log line is privacy-equivalent to the signBind log:
+   *     account + registry + exp, no claims beyond what consumers
+   *     can already correlate from the on-chain bind tx.
+   */
+  async issueProverSession(
+    req: IssueProverSessionRequest,
+  ): Promise<IssueProverSessionResponse> {
+    // ── Validate the request shape ──────────────────────────────
+    if (!req || typeof req !== 'object') {
+      badRequest('BAD_REQUEST', 'request body is missing or not an object');
+    }
+    if (typeof req.registry !== 'string' || !isAddress(req.registry)) {
+      badRequest('BAD_REGISTRY', 'request.registry is not a valid address');
+    }
+    if (typeof req.account !== 'string' || !isAddress(req.account)) {
+      badRequest('BAD_ACCOUNT', 'request.account is not a valid address');
+    }
+    const requestedRegistry = getAddress(req.registry);
+    const requestedAccount = getAddress(req.account);
+
+    // ── Pinned-registry allowlist (same gate as signBind) ───────
+    const allowedRegistryRaw = this.env.NULLIFIER_REGISTRY_ADDRESS;
+    if (!isAddress(allowedRegistryRaw)) {
+      throw new AttesterError(
+        'BAD_REGISTRY_VAR',
+        `NULLIFIER_REGISTRY_ADDRESS var is malformed: ${allowedRegistryRaw}`,
+      );
+    }
+    const allowedRegistry = getAddress(allowedRegistryRaw);
+    if (requestedRegistry !== allowedRegistry) {
+      badRequest(
+        'REGISTRY_NOT_ALLOWED',
+        `attester refuses to issue a prover session for registry ${requestedRegistry}; ` +
+          `pinned registry is ${allowedRegistry}`,
+      );
+    }
+
+    // ── Resolve the JWT shape from env ──────────────────────────
+    const issuer = this.env.JWT_ISSUER;
+    const audience = this.env.JWT_AUDIENCE;
+    if (typeof issuer !== 'string' || issuer.length === 0) {
+      throw new AttesterError('BAD_JWT_ISSUER_VAR', 'JWT_ISSUER var is missing');
+    }
+    if (typeof audience !== 'string' || audience.length === 0) {
+      throw new AttesterError('BAD_JWT_AUDIENCE_VAR', 'JWT_AUDIENCE var is missing');
+    }
+
+    const ttlRaw = this.env.PROVER_SESSION_TTL_SECONDS;
+    if (!/^\d+$/.test(ttlRaw)) {
+      throw new AttesterError(
+        'BAD_JWT_TTL_VAR',
+        `PROVER_SESSION_TTL_SECONDS var is malformed: ${ttlRaw}`,
+      );
+    }
+    const ttlSeconds = Number(ttlRaw);
+    if (ttlSeconds < 1 || ttlSeconds > 3600) {
+      throw new AttesterError(
+        'BAD_JWT_TTL_RANGE',
+        `PROVER_SESSION_TTL_SECONDS must be 1..3600, got ${ttlSeconds}`,
+      );
+    }
+
+    // ── Validate the shared secret ──────────────────────────────
+    const secretRaw = this.env.JWT_SHARED_SECRET;
+    if (typeof secretRaw !== 'string' || secretRaw.length < 32) {
+      throw new AttesterError(
+        'BAD_JWT_SECRET',
+        'JWT_SHARED_SECRET secret is missing or too short (≥32 chars required)',
+      );
+    }
+
+    // ── Sign the JWT ────────────────────────────────────────────
+    const iat = Math.floor(Date.now() / 1000);
+    const exp = iat + ttlSeconds;
+    const key = new TextEncoder().encode(secretRaw);
+
+    const jwt = await new SignJWT({ registry: requestedRegistry })
+      .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
+      .setIssuer(issuer)
+      .setAudience(audience)
+      .setSubject(requestedAccount)
+      .setIssuedAt(iat)
+      .setNotBefore(iat)
+      .setExpirationTime(exp)
+      .sign(key);
+
+    // ── Audit log ───────────────────────────────────────────────
+    // No secrets / no JWT body / no nullifier. The (account, registry,
+    // exp) tuple is sufficient for replay-reconciliation against the
+    // cofferdam-prover Worker's prove-request log in Workers Logs.
+    console.log(
+      JSON.stringify({
+        kind: 'attester.issueProverSession',
+        environment: this.env.ENVIRONMENT,
+        account: requestedAccount,
+        registry: requestedRegistry,
+        exp,
+        ttlSeconds,
+      }),
+    );
+
+    return {
+      jwt,
+      exp,
+      account: requestedAccount,
+      registry: requestedRegistry,
     };
   }
 
