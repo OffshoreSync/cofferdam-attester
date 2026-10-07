@@ -1,4 +1,4 @@
-// Copyright (c) 2026 OffshoreSync LLC
+// Copyright (c) 2026 Cofferdam Inc
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -34,8 +34,20 @@ import type {
   IssueProverSessionResponse,
   SignBindRequest,
   SignBindResponse,
+  SignBindWithAttestationRequest,
+  SignBindWithAttestationResponse,
 } from './rpc.js';
-import { signBindAttestation } from './sign.js';
+import {
+  SelfAttestationError,
+  parseImageDigestAllowlist,
+  verifySelfAttestation,
+} from './selfAttestation.js';
+import {
+  calculateUserIdentifierHash,
+  decodeUserContextData,
+  signBindAttestation,
+  type DecodedUserContext,
+} from './sign.js';
 
 // ────────────────────────────────────────────────────────────────────
 // Constants — `vc_and_disclose` public-signal indices.
@@ -136,12 +148,138 @@ export default class CofferdamAttester
    * and emits an audit log line.
    */
   async signBind(req: SignBindRequest): Promise<SignBindResponse> {
+    const prepared = this.#prepareBind(req);
+    return this.#signPrepared(prepared, { kind: 'attester.signBind' });
+  }
+
+  /**
+   * Verify a Self proving-enclave attestation, then sign a bind.
+   *
+   * ⚠️ Read `selfAttestation.ts`'s header before relying on this. The
+   * attestation is minted during the TEE handshake, before the proof
+   * exists, so it cannot vouch for the nullifier in `req.pubSignals`.
+   * A patched app can present a genuine attestation alongside a
+   * fabricated nullifier and this method will happily sign it.
+   *
+   * Two hard gates keep that blast radius on testnet:
+   *   1. `ENVIRONMENT=production` refuses this method outright.
+   *   2. `BIND_GATE_MODE` must be explicitly set to `'attestation'`,
+   *      so a deploy cannot fall into this path by omission.
+   */
+  async signBindWithAttestation(
+    req: SignBindWithAttestationRequest,
+  ): Promise<SignBindWithAttestationResponse> {
+    // ── Gate 1: never on mainnet ────────────────────────────────
+    // Deliberately the very first check, before any input parsing,
+    // so a production deploy fails loudly and identically for every
+    // request shape.
+    if (this.env.ENVIRONMENT === 'production') {
+      throw new AttesterError(
+        'ATTESTATION_GATE_FORBIDDEN_IN_PRODUCTION',
+        'signBindWithAttestation is testnet-only: a TEE attestation binds the ECDH ' +
+          'channel, not the nullifier, so it cannot authorise a mainnet bind. ' +
+          'Use BIND_GATE_MODE=celo and signBind.',
+      );
+    }
+
+    // ── Gate 2: explicit opt-in via BIND_GATE_MODE ──────────────
+    const gateMode = this.env.BIND_GATE_MODE;
+    if (gateMode !== 'attestation') {
+      throw new AttesterError(
+        'ATTESTATION_GATE_DISABLED',
+        `signBindWithAttestation requires BIND_GATE_MODE=attestation, got ` +
+          `${String(gateMode)}`,
+      );
+    }
+
+    if (!req || typeof req !== 'object') {
+      badRequest('BAD_REQUEST', 'request body is missing or not an object');
+    }
+    if (typeof req.attestation !== 'string' || req.attestation.length === 0) {
+      badRequest('BAD_ATTESTATION', 'request.attestation must be a non-empty JWT string');
+    }
+
+    // ── Verify the enclave attestation ──────────────────────────
+    // Runs BEFORE request validation so a malformed attestation is
+    // rejected without us touching pubSignals at all.
+    const isDevelopment = this.env.ENVIRONMENT === 'development';
+    let allowedImageDigests: ReadonlySet<string>;
+    try {
+      allowedImageDigests = parseImageDigestAllowlist(this.env.SELF_TEE_IMAGE_DIGESTS);
+    } catch (err) {
+      // A malformed allowlist var is an operator error, not a caller
+      // error — surface it distinctly so it is not mistaken for a
+      // rejected attestation.
+      throw new AttesterError(
+        'BAD_IMAGE_DIGEST_VAR',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+
+    let verified;
+    try {
+      verified = verifySelfAttestation(req.attestation, {
+        allowedImageDigests,
+        allowDebugEnclave: isDevelopment,
+      });
+    } catch (err) {
+      if (err instanceof SelfAttestationError) {
+        // Log the rejection before rethrowing: a spike in a single
+        // code is the signal that Self rotated enclave images and
+        // SELF_TEE_IMAGE_DIGESTS needs updating.
+        console.log(
+          JSON.stringify({
+            kind: 'attester.attestationRejected',
+            environment: this.env.ENVIRONMENT,
+            code: err.code,
+            message: err.message,
+          }),
+        );
+        badRequest(err.code, err.message);
+      }
+      throw err;
+    }
+
+    const prepared = this.#prepareBind(req);
+    const signed = await this.#signPrepared(prepared, {
+      kind: 'attester.signBindWithAttestation',
+      extra: {
+        gate: 'attestation',
+        enclaveImageDigest: verified.imageDigest,
+        enclaveDebugStatus: verified.debugStatus,
+        attestationIssuedAt: verified.issuedAt,
+        attestationExpiresAt: verified.expiresAt,
+      },
+    });
+
+    return {
+      ...signed,
+      enclaveImageDigest: verified.imageDigest,
+      gate: 'attestation',
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // Shared bind plumbing. Both public bind methods funnel through
+  // these so the pinned-chain / pinned-registry / pubSignals checks
+  // and the audit-log shape can never drift between gates.
+  // ──────────────────────────────────────────────────────────────
+
+  #prepareBind(req: SignBindRequest): {
+    chainId: bigint;
+    chainIdStr: string;
+    registry: Hex;
+    account: Hex;
+    pubSignals: bigint[];
+    userContextData: Hex;
+    selfDestChainId: bigint;
+  } {
     // ── Pull pinned values from env ─────────────────────────────
-    const chainIdStr = this.env.ZKSYNC_SEPOLIA_CHAIN_ID;
+    const chainIdStr = this.env.BASE_CHAIN_ID;
     if (!/^\d+$/.test(chainIdStr)) {
       throw new AttesterError(
         'BAD_CHAIN_ID_VAR',
-        `ZKSYNC_SEPOLIA_CHAIN_ID var is malformed: ${chainIdStr}`,
+        `BASE_CHAIN_ID var is malformed: ${chainIdStr}`,
       );
     }
     const chainId = BigInt(chainIdStr);
@@ -181,23 +319,80 @@ export default class CofferdamAttester
 
     // ── Cross-field consistency (cheap pre-flight) ──────────────
     // The on-chain registry already enforces these; doing it here
-    // turns a confusing `verifyAttesterSig` failure on-chain into
-    // a clear off-chain error before we waste gas.
-    const userIdentifier = pubSignals[PUB_SIGNAL_INDEX.USER_IDENTIFIER]!;
-    const accountAsUint = BigInt(requestedAccount);
-    if (userIdentifier !== accountAsUint) {
+    // turns a confusing revert on-chain into a clear off-chain error
+    // before we waste gas.
+    //
+    // NOTE: pubSignals[USER_IDENTIFIER] is NOT uint160(account). Self
+    // emits ripemd160(sha256(userContextData)), so the only way to tie
+    // the proof to `account` is to recompute that commitment and then
+    // inspect the id embedded in the preimage. Comparing the signal to
+    // the address directly rejects every genuine proof.
+    const userContextData = req.userContextData;
+    if (typeof userContextData !== 'string' || !/^0x[0-9a-fA-F]*$/.test(userContextData)) {
       badRequest(
-        'USER_IDENTIFIER_MISMATCH',
-        `pubSignals[USER_IDENTIFIER] (${userIdentifier}) does not equal account (${accountAsUint})`,
+        'BAD_USER_CONTEXT_FORMAT',
+        'userContextData must be a 0x-prefixed hex string',
       );
     }
 
-    // ── Sign ────────────────────────────────────────────────────
+    let decoded: DecodedUserContext;
+    try {
+      decoded = decodeUserContextData(userContextData);
+    } catch (err) {
+      badRequest(
+        'BAD_USER_CONTEXT_LENGTH',
+        err instanceof Error ? err.message : 'userContextData is malformed',
+      );
+    }
+
+    if (getAddress(decoded.userId) !== getAddress(requestedAccount)) {
+      badRequest(
+        'USER_IDENTIFIER_MISMATCH',
+        `userContextData names ${decoded.userId}, not the requested account ${requestedAccount}`,
+      );
+    }
+
+    const expectedUserIdentifier = calculateUserIdentifierHash(userContextData);
+    const userIdentifier = pubSignals[PUB_SIGNAL_INDEX.USER_IDENTIFIER]!;
+    if (userIdentifier !== expectedUserIdentifier) {
+      badRequest(
+        'USER_IDENTIFIER_COMMITMENT_MISMATCH',
+        `pubSignals[USER_IDENTIFIER] (${userIdentifier}) does not match the ` +
+          `commitment over userContextData (${expectedUserIdentifier})`,
+      );
+    }
+
+    return {
+      chainId,
+      chainIdStr,
+      registry: requestedRegistry,
+      account: requestedAccount,
+      pubSignals,
+      userContextData,
+      selfDestChainId: decoded.destChainId,
+    };
+  }
+
+  async #signPrepared(
+    prepared: {
+      chainId: bigint;
+      chainIdStr: string;
+      registry: Hex;
+      account: Hex;
+      pubSignals: bigint[];
+      userContextData: Hex;
+      selfDestChainId: bigint;
+    },
+    audit: { kind: string; extra?: Record<string, unknown> },
+  ): Promise<SignBindResponse> {
+    const { chainId, chainIdStr, registry, account, pubSignals, userContextData } =
+      prepared;
+
     assertPrivateKey(this.env.ATTESTER_PRIVATE_KEY);
     const signed = await signBindAttestation(this.env.ATTESTER_PRIVATE_KEY, {
       chainId,
-      registry: requestedRegistry,
-      account: requestedAccount,
+      registry,
+      account,
       pubSignals,
     });
 
@@ -209,16 +404,21 @@ export default class CofferdamAttester
     // disclosure data depending on Self circuit version).
     console.log(
       JSON.stringify({
-        kind: 'attester.signBind',
+        kind: audit.kind,
         environment: this.env.ENVIRONMENT,
         chainId: chainIdStr,
-        registry: requestedRegistry,
-        account: requestedAccount,
+        registry,
+        account,
         attestationId: pubSignals[PUB_SIGNAL_INDEX.ATTESTATION_ID]!.toString(),
         scope: pubSignals[PUB_SIGNAL_INDEX.SCOPE]!.toString(),
         nullifier: pubSignals[PUB_SIGNAL_INDEX.NULLIFIER]!.toString(),
         attesterAddress: signed.attesterAddress,
         messageHash: signed.messageHash,
+        // Self's declared destination chain, folded into the
+        // userIdentifier commitment. Must match the registry's
+        // `selfDestChainId` immutable or the bind reverts on-chain.
+        selfDestChainId: prepared.selfDestChainId.toString(),
+        ...audit.extra,
       }),
     );
 
@@ -227,8 +427,9 @@ export default class CofferdamAttester
       messageHash: signed.messageHash,
       signature: signed.signature,
       chainId: chainIdStr,
-      registry: requestedRegistry,
-      account: requestedAccount,
+      registry,
+      account,
+      userContextData,
     };
   }
 
@@ -236,10 +437,9 @@ export default class CofferdamAttester
    * Issue a short-lived JWT pairing a prover request to a specific
    * (account, registry) combo.
    *
-   * The cofferdam-prover Worker verifies this JWT locally via the
-   * same HS256 shared secret and rejects any /v1/prove call whose
-   * Authorization header doesn't carry a valid, unexpired token
-   * with matching claims.
+   * The caller verifies this JWT locally via the same HS256 shared
+   * secret and rejects any request whose Authorization header doesn't
+   * carry a valid, unexpired token with matching claims.
    *
    * Hot-path constraints:
    *   - No on-chain reads. The registry-allowlist gate is the same
@@ -335,7 +535,7 @@ export default class CofferdamAttester
     // ── Audit log ───────────────────────────────────────────────
     // No secrets / no JWT body / no nullifier. The (account, registry,
     // exp) tuple is sufficient for replay-reconciliation against the
-    // cofferdam-prover Worker's prove-request log in Workers Logs.
+    // caller's request log in Workers Logs.
     console.log(
       JSON.stringify({
         kind: 'attester.issueProverSession',

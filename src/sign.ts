@@ -1,4 +1,4 @@
-// Copyright (c) 2026 OffshoreSync LLC
+// Copyright (c) 2026 Cofferdam Inc
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -26,11 +26,60 @@
 
 import {
   encodeAbiParameters,
+  getAddress,
   isAddress,
   keccak256,
+  ripemd160,
+  sha256,
+  size,
+  slice,
   type Hex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+
+/**
+ * Recompute Self's `userIdentifier` public signal from its preimage.
+ *
+ * The `vc_and_disclose` circuit does NOT emit the user's address in signal
+ * 20 — it emits a 160-bit commitment:
+ *
+ *     userContextData = abi.encodePacked(
+ *         bytes32(destChainID),   // SelfApp.chainID, left-padded
+ *         bytes32(userId),        // left-padded, hyphens stripped
+ *         bytes(userDefinedData))
+ *     userIdentifier  = uint160(ripemd160(sha256(userContextData)))
+ *
+ * Mirrors `calculateUserIdentifierHash` in `self/common/src/utils/hash.ts`
+ * and `NullifierRegistry._checkUserContext` on-chain.
+ */
+export function calculateUserIdentifierHash(userContextData: Hex): bigint {
+  return BigInt(ripemd160(sha256(userContextData)));
+}
+
+/** Fields the registry slices out of `userContextData`. */
+export interface DecodedUserContext {
+  /** Self's declared destination chain (`SelfApp.chainID`), not the host chain. */
+  readonly destChainId: bigint;
+  /** The embedded user id, narrowed to an address. */
+  readonly userId: Hex;
+}
+
+/**
+ * Decode the fixed 64-byte head of `userContextData`. Throws if the payload
+ * is too short to contain both words.
+ */
+export function decodeUserContextData(userContextData: Hex): DecodedUserContext {
+  if (size(userContextData) < 64) {
+    throw new Error(
+      `userContextData must be at least 64 bytes, got ${size(userContextData)}`,
+    );
+  }
+  return {
+    destChainId: BigInt(slice(userContextData, 0, 32)),
+    // Self left-pads the id to 32 bytes; the low 20 are the address.
+    userId: getAddress(slice(userContextData, 44, 64)),
+  };
+}
 
 /**
  * Compile-time fixed-length tuple. Used to satisfy viem's

@@ -37,18 +37,63 @@
   "vars": {
     "ENVIRONMENT": "development",
 
-    // ZKSync Era Sepolia chain id. Hardcoded into the message-hash
+    // Base Sepolia chain id. Hardcoded into the message-hash
     // preimage; if mainnet ever lights up we deploy a separate
     // attester Worker (cofferdam-attester-mainnet) instead of
     // multiplexing across chains in a single signer.
-    "ZKSYNC_SEPOLIA_CHAIN_ID": "300",
+    // Base mainnet would be "8453".
+    "BASE_CHAIN_ID": "84532",
+
+    // ── Self bind gate (staged) ─────────────────────────────────
+    // 'attestation' — verify the Self enclave's GCP Confidential
+    //                 Space attestation, then trust the caller's
+    //                 pubSignals. TESTNET ONLY: the attestation
+    //                 binds the TEE's ECDH channel, which is minted
+    //                 during the handshake BEFORE the proof exists,
+    //                 so it cannot vouch for the accompanying
+    //                 nullifier. A patched app can pair a genuine
+    //                 attestation with a fabricated nullifier.
+    // 'celo'        — re-verify the Groth16 proof + identity
+    //                 commitment root against Self's registry on
+    //                 Celo via eth_call. Required before mainnet.
+    //
+    // The Worker hard-fails `signBindWithAttestation` whenever
+    // ENVIRONMENT is "production", regardless of this value.
+    "BIND_GATE_MODE": "attestation",
+
+    // Allowlisted Self proving-enclave image measurements — sha256
+    // hex of `submods.container.image_digest` from the attestation
+    // JWT. Comma/whitespace separated; the `sha256:` prefix is
+    // optional. Self calls this "PCR0" (legacy AWS Nitro naming;
+    // their TEE is GCP Confidential Space, not Nitro) and keeps the
+    // canonical list on-chain in PCR0Manager
+    // 0xE36d4EE5Fd3916e703A46C21Bb3837dB7680C8B8 on Celo.
+    //
+    // Empty is tolerated ONLY when ENVIRONMENT=development, which
+    // also relaxes the `dbgstat` debug-disabled requirement. Before
+    // staging, populate this by capturing the digest from a real
+    // device run — see docs/SELF_SMOKE_TEST.md.
+    "SELF_TEE_IMAGE_DIGESTS": "",
 
     // Sole NullifierRegistry the attester is willing to sign for.
     // Single-element allowlist for α; on rotation, deploy a new
     // attester Worker pointing at the new registry, then flip the
     // SelfAttesterRegistry trust set on-chain.
-    // Mirrors cofferdam-api/src/chain/deployments.ts.
-    "NULLIFIER_REGISTRY_ADDRESS": "0x8b26DE05470961DE31691bCBdE3de8A3572F8AdC",
+    //
+    // MUST stay identical to `SEPOLIA_DEPLOYMENTS.NullifierRegistry` in
+    // cofferdam-api/src/chain/deployments.ts — any divergence makes `signBind`
+    // reject every call with REGISTRY_NOT_ALLOWED. (These two drifted before,
+    // which silently broke /v1/attester/test-sign.)
+    //
+    // This registry pins expectedScope = Poseidon(cofferdam.xyz ×
+    // cofferdam-bind-v1) and selfDestChainId = 42220, both immutable.
+    // Requires ATTESTER_PRIVATE_KEY to be the key for
+    // 0x2dFDdE621680A270cC01E8D9D729f25a46Bdae59, the sole attester trusted by
+    // SelfAttesterRegistry 0x8F3fF40Aa7Eb46b9AB214229D8f7833bbC47ae08.
+    // That key lives in TWO places that rotations must both update: the
+    // Cloudflare secret (deployed) and .dev.vars (local `wrangler dev`).
+    // Rotate with base-contracts/scripts/rotate-self-attester.ts.
+    "NULLIFIER_REGISTRY_ADDRESS": "0x2843F55C9E1491a6d47F65f041E68F96E3aeB3d4",
 
     // ── JWT issuance (Session 4 NEW — for cofferdam-prover) ─────
     // The `issueProverSession` RPC returns a short-lived HS256 JWT
