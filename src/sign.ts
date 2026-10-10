@@ -93,7 +93,7 @@ type FixedTuple<T, N extends number, A extends T[] = []> = A['length'] extends N
 export type PubSignalsTuple = FixedTuple<bigint, 21>;
 
 export interface BindAttestationInputs {
-  /** Chain ID as bigint (e.g. `300n` for ZKSync Era Sepolia). */
+  /** Chain ID as bigint (e.g. `84532n` for Base Sepolia). */
   readonly chainId: bigint;
   /** EIP-55 address of the target `NullifierRegistry`. */
   readonly registry: Hex;

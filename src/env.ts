@@ -27,7 +27,7 @@ export interface Env {
    * the attester rejects sign requests whose target chain doesn't
    * match.
    *
-   * Replaces the pre-Base `ZKSYNC_SEPOLIA_CHAIN_ID` var ('300'). If
+   * If
    * mainnet ever lights up we deploy a separate attester Worker
    * rather than multiplexing chains through one signer.
    */
