@@ -4,125 +4,52 @@
 /**
  * Cofferdam Self attester Worker — entry point.
  *
- * Exposes a single RPC method, `signBind`, that returns an EIP-191
- * personal_sign over `NullifierRegistry.attesterMessageHash(...)`.
- * This Worker is the only place in the Cofferdam stack where the
- * SelfAttester private key is ever deserialised; every other surface
- * touches it via this binding.
+ * Exposes one RPC method, `signBind`, that returns an EIP-191 personal_sign
+ * over `NullifierRegistry.attesterMessageHash(...)` — but only after the Celo
+ * gate has confirmed the proof's identity-commitment root, OFAC roots and
+ * date against Self's own registry (decision 0004). This Worker is the only
+ * place in the Cofferdam stack where the SelfAttester private key is ever
+ * deserialised; every other surface reaches it through this binding.
  *
- * Defense layers (per IDENTITY_LAYER_DESIGN.md §4):
+ * Defense layers:
  *   1. `workers_dev: false` + zero routes → no public ingress.
- *   2. Service-binding only → only Workers in this Cloudflare account
- *      can reach this Worker.
- *   3. Pinned chain id + registry allowlist → a compromised consumer
- *      Worker cannot extract a signature usable on any other chain
- *      or against any other NullifierRegistry.
- *   4. Strict input validation → malformed `pubSignals` (wrong length,
- *      out-of-range field elements) reject before any signing happens.
- *   5. Audit log per request → every sign event hits Workers Logs
- *      with (account, registry, attestationId, scope, hash); replay
- *      auditor reconciles against on-chain `NullifierBound` events.
+ *   2. Service-binding only → only Workers in this Cloudflare account call it.
+ *   3. Pinned Base chain id + registry allowlist → a compromised consumer
+ *      Worker cannot obtain a signature usable on another chain or registry.
+ *   4. Strict input validation (`bind.ts`) → malformed requests reject before
+ *      any network call or signing.
+ *   5. Celo gate (`celoGate.ts`) → the one check Base cannot do itself: the
+ *      proof's Merkle root is a root Self actually published.
+ *   6. Audit log per request → every sign and every rejection hits Workers
+ *      Logs; a replay auditor reconciles sign events against on-chain
+ *      `NullifierBound` events.
  */
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
-import { SignJWT } from 'jose';
-import { getAddress, isAddress, isHex, type Hex } from 'viem';
+import { getAddress, isAddress, isHex, type Address, type Hex } from 'viem';
+import { AttesterError, badRequest, prepareBindRequest, type PreparedBind } from './bind.js';
+import {
+  CeloGateError,
+  PASSPORT_DISCLOSE_INDEX,
+  createCeloReads,
+  verifyProofOnCelo,
+  type CeloGateConfig,
+  type CeloGateResult,
+  type CeloReads,
+} from './celoGate.js';
 import type { Env } from './env.js';
-import type {
-  AttesterRpc,
-  IssueProverSessionRequest,
-  IssueProverSessionResponse,
-  SignBindRequest,
-  SignBindResponse,
-  SignBindWithAttestationRequest,
-  SignBindWithAttestationResponse,
-} from './rpc.js';
-import {
-  SelfAttestationError,
-  parseImageDigestAllowlist,
-  verifySelfAttestation,
-} from './selfAttestation.js';
-import {
-  calculateUserIdentifierHash,
-  decodeUserContextData,
-  signBindAttestation,
-  type DecodedUserContext,
-} from './sign.js';
+import type { AttesterRpc, SignBindRequest, SignBindResponse } from './rpc.js';
+import { signBindAttestation } from './sign.js';
 
-// ────────────────────────────────────────────────────────────────────
-// Constants — `vc_and_disclose` public-signal indices.
-// Mirrors contracts/v2/self/SelfPublicSignals.sol; the on-chain
-// validation in `NullifierRegistry.verifyAndBind` will reject any
-// proof whose pubSignals don't satisfy these, but we mirror them
-// here so we can audit-log meaningful values per request.
-// ────────────────────────────────────────────────────────────────────
-const PUB_SIGNAL_INDEX = {
-  NULLIFIER: 7,
-  ATTESTATION_ID: 8,
-  SCOPE: 19,
-  USER_IDENTIFIER: 20,
-} as const;
-
-const PUB_SIGNALS_LENGTH = 21;
-
-/** Max value of a uint256 — sanity-bound for incoming pubSignals. */
-const UINT256_MAX = (1n << 256n) - 1n;
-
-// ────────────────────────────────────────────────────────────────────
-// Domain errors. Surfaced as throws over RPC; the runtime serialises
-// them with the message intact so consumers can branch on `.message`.
-// ────────────────────────────────────────────────────────────────────
-class AttesterError extends Error {
-  constructor(public readonly code: string, message: string) {
-    super(message);
-    this.name = 'AttesterError';
+/** One viem client per isolate per RPC URL; rebuilt only if the var changes. */
+let celoReadsCache: { rpcUrl: string; reads: CeloReads } | null = null;
+function celoReadsFor(rpcUrl: string): CeloReads {
+  if (!celoReadsCache || celoReadsCache.rpcUrl !== rpcUrl) {
+    celoReadsCache = { rpcUrl, reads: createCeloReads(rpcUrl) };
   }
+  return celoReadsCache.reads;
 }
 
-function badRequest(code: string, message: string): never {
-  throw new AttesterError(code, message);
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Validation helpers.
-// ────────────────────────────────────────────────────────────────────
-
-function parsePubSignals(raw: readonly string[]): bigint[] {
-  if (!Array.isArray(raw) || raw.length !== PUB_SIGNALS_LENGTH) {
-    badRequest(
-      'BAD_PUBSIGNALS_LENGTH',
-      `pubSignals must be an array of ${PUB_SIGNALS_LENGTH} decimal strings; got ${
-        Array.isArray(raw) ? raw.length : typeof raw
-      }`,
-    );
-  }
-  const out: bigint[] = new Array(PUB_SIGNALS_LENGTH);
-  for (let i = 0; i < PUB_SIGNALS_LENGTH; i++) {
-    const s = raw[i];
-    if (typeof s !== 'string' || !/^\d+$/.test(s)) {
-      badRequest(
-        'BAD_PUBSIGNAL_FORMAT',
-        `pubSignals[${i}] must be a non-negative decimal string, got ${typeof s}`,
-      );
-    }
-    let v: bigint;
-    try {
-      v = BigInt(s);
-    } catch {
-      badRequest('BAD_PUBSIGNAL_PARSE', `pubSignals[${i}] failed to parse as BigInt`);
-    }
-    if (v < 0n || v > UINT256_MAX) {
-      badRequest('PUBSIGNAL_OUT_OF_RANGE', `pubSignals[${i}] out of uint256 range`);
-    }
-    out[i] = v;
-  }
-  return out;
-}
-
-/**
- * Best-effort hex private key sanity check. Doesn't validate the
- * curve order (viem does that on `privateKeyToAccount`).
- */
 function assertPrivateKey(pk: string): asserts pk is Hex {
   if (!isHex(pk) || pk.length !== 66 /* 0x + 64 hex chars */) {
     throw new AttesterError(
@@ -132,261 +59,95 @@ function assertPrivateKey(pk: string): asserts pk is Hex {
   }
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Worker.
-// ────────────────────────────────────────────────────────────────────
-
-export default class CofferdamAttester
-  extends WorkerEntrypoint<Env>
-  implements AttesterRpc
-{
+export default class CofferdamAttester extends WorkerEntrypoint<Env> implements AttesterRpc {
   /**
-   * Sign a bind attestation.
+   * Gate and sign a bind.
    *
-   * Validates inputs, recomputes `attesterMessageHash` exactly as the
-   * on-chain `NullifierRegistry`, signs with EIP-191 personal_sign,
-   * and emits an audit log line.
+   * Validates the request against the deploy-time pins, re-verifies the
+   * proof's Celo-anchored facts, recomputes `attesterMessageHash` exactly as
+   * the on-chain registry does, signs it, and emits an audit line.
    */
   async signBind(req: SignBindRequest): Promise<SignBindResponse> {
-    const prepared = this.#prepareBind(req);
-    return this.#signPrepared(prepared, { kind: 'attester.signBind' });
+    const prepared = prepareBindRequest(
+      {
+        chainIdStr: this.env.BASE_CHAIN_ID,
+        allowedRegistryRaw: this.env.NULLIFIER_REGISTRY_ADDRESS,
+      },
+      req,
+    );
+    const celo = await this.#gateOnCelo(prepared);
+    return this.#signPrepared(prepared, celo);
   }
 
-  /**
-   * Verify a Self proving-enclave attestation, then sign a bind.
-   *
-   * ⚠️ Read `selfAttestation.ts`'s header before relying on this. The
-   * attestation is minted during the TEE handshake, before the proof
-   * exists, so it cannot vouch for the nullifier in `req.pubSignals`.
-   * A patched app can present a genuine attestation alongside a
-   * fabricated nullifier and this method will happily sign it.
-   *
-   * Two hard gates keep that blast radius on testnet:
-   *   1. `ENVIRONMENT=production` refuses this method outright.
-   *   2. `BIND_GATE_MODE` must be explicitly set to `'attestation'`,
-   *      so a deploy cannot fall into this path by omission.
-   */
-  async signBindWithAttestation(
-    req: SignBindWithAttestationRequest,
-  ): Promise<SignBindWithAttestationResponse> {
-    // ── Gate 1: never on mainnet ────────────────────────────────
-    // Deliberately the very first check, before any input parsing,
-    // so a production deploy fails loudly and identically for every
-    // request shape.
-    if (this.env.ENVIRONMENT === 'production') {
+  /** Read and validate the Celo pins. Malformed vars are operator errors, not caller errors. */
+  #celoConfig(): CeloGateConfig & { rpcUrl: string } {
+    const rpcUrl = this.env.CELO_RPC_URL;
+    if (typeof rpcUrl !== 'string' || !/^https:\/\//.test(rpcUrl)) {
+      throw new AttesterError('BAD_CELO_RPC_VAR', 'CELO_RPC_URL must be an https:// URL');
+    }
+    const chainIdStr = this.env.SELF_CELO_CHAIN_ID;
+    if (!/^\d+$/.test(chainIdStr ?? '')) {
+      throw new AttesterError('BAD_CELO_CHAIN_ID_VAR', `SELF_CELO_CHAIN_ID var is malformed: ${chainIdStr}`);
+    }
+    const hub = this.env.SELF_HUB_ADDRESS;
+    if (!isAddress(hub ?? '')) {
+      throw new AttesterError('BAD_SELF_HUB_VAR', `SELF_HUB_ADDRESS var is malformed: ${hub}`);
+    }
+    const passportRegistry = this.env.SELF_PASSPORT_REGISTRY_ADDRESS;
+    if (!isAddress(passportRegistry ?? '')) {
       throw new AttesterError(
-        'ATTESTATION_GATE_FORBIDDEN_IN_PRODUCTION',
-        'signBindWithAttestation is testnet-only: a TEE attestation binds the ECDH ' +
-          'channel, not the nullifier, so it cannot authorise a mainnet bind. ' +
-          'Use BIND_GATE_MODE=celo and signBind.',
+        'BAD_SELF_REGISTRY_VAR',
+        `SELF_PASSPORT_REGISTRY_ADDRESS var is malformed: ${passportRegistry}`,
+      );
+    }
+    return {
+      rpcUrl,
+      chainId: BigInt(chainIdStr),
+      hub: getAddress(hub) as Address,
+      passportRegistry: getAddress(passportRegistry) as Address,
+    };
+  }
+
+  async #gateOnCelo(prepared: PreparedBind): Promise<CeloGateResult> {
+    const config = this.#celoConfig();
+
+    // The proof commits to Self's destination chain inside userContextData.
+    // It must be the Celo we are about to query, and the registry on Base
+    // pins the same value immutably.
+    if (prepared.selfDestChainId !== config.chainId) {
+      badRequest(
+        'WRONG_DEST_CHAIN_ID',
+        `userContextData declares destination chain ${prepared.selfDestChainId.toString()}, ` +
+          `attester is pinned to Celo ${config.chainId.toString()}`,
       );
     }
 
-    // ── Gate 2: explicit opt-in via BIND_GATE_MODE ──────────────
-    const gateMode = this.env.BIND_GATE_MODE;
-    if (gateMode !== 'attestation') {
-      throw new AttesterError(
-        'ATTESTATION_GATE_DISABLED',
-        `signBindWithAttestation requires BIND_GATE_MODE=attestation, got ` +
-          `${String(gateMode)}`,
-      );
-    }
-
-    if (!req || typeof req !== 'object') {
-      badRequest('BAD_REQUEST', 'request body is missing or not an object');
-    }
-    if (typeof req.attestation !== 'string' || req.attestation.length === 0) {
-      badRequest('BAD_ATTESTATION', 'request.attestation must be a non-empty JWT string');
-    }
-
-    // ── Verify the enclave attestation ──────────────────────────
-    // Runs BEFORE request validation so a malformed attestation is
-    // rejected without us touching pubSignals at all.
-    const isDevelopment = this.env.ENVIRONMENT === 'development';
-    let allowedImageDigests: ReadonlySet<string>;
     try {
-      allowedImageDigests = parseImageDigestAllowlist(this.env.SELF_TEE_IMAGE_DIGESTS);
+      return await verifyProofOnCelo(celoReadsFor(config.rpcUrl), config, prepared.pubSignals);
     } catch (err) {
-      // A malformed allowlist var is an operator error, not a caller
-      // error — surface it distinctly so it is not mistaken for a
-      // rejected attestation.
-      throw new AttesterError(
-        'BAD_IMAGE_DIGEST_VAR',
-        err instanceof Error ? err.message : String(err),
-      );
-    }
-
-    let verified;
-    try {
-      verified = verifySelfAttestation(req.attestation, {
-        allowedImageDigests,
-        allowDebugEnclave: isDevelopment,
-      });
-    } catch (err) {
-      if (err instanceof SelfAttestationError) {
-        // Log the rejection before rethrowing: a spike in a single
-        // code is the signal that Self rotated enclave images and
-        // SELF_TEE_IMAGE_DIGESTS needs updating.
+      if (err instanceof CeloGateError) {
+        // A spike in one code is a signal: CELO_REGISTRY_MISMATCH means Self
+        // migrated its registry; CELO_OFAC_ROOTS_STALE in bulk means a
+        // sanctions snapshot rolled mid-session; CELO_RPC_UNAVAILABLE is ours.
         console.log(
           JSON.stringify({
-            kind: 'attester.attestationRejected',
+            kind: 'attester.celoGateRejected',
             environment: this.env.ENVIRONMENT,
             code: err.code,
+            retryable: err.retryable,
             message: err.message,
+            account: prepared.account,
+            nullifier: prepared.nullifier.toString(),
           }),
         );
-        badRequest(err.code, err.message);
+        throw new AttesterError(err.code, err.message, err.retryable);
       }
       throw err;
     }
-
-    const prepared = this.#prepareBind(req);
-    const signed = await this.#signPrepared(prepared, {
-      kind: 'attester.signBindWithAttestation',
-      extra: {
-        gate: 'attestation',
-        enclaveImageDigest: verified.imageDigest,
-        enclaveDebugStatus: verified.debugStatus,
-        attestationIssuedAt: verified.issuedAt,
-        attestationExpiresAt: verified.expiresAt,
-      },
-    });
-
-    return {
-      ...signed,
-      enclaveImageDigest: verified.imageDigest,
-      gate: 'attestation',
-    };
   }
 
-  // ──────────────────────────────────────────────────────────────
-  // Shared bind plumbing. Both public bind methods funnel through
-  // these so the pinned-chain / pinned-registry / pubSignals checks
-  // and the audit-log shape can never drift between gates.
-  // ──────────────────────────────────────────────────────────────
-
-  #prepareBind(req: SignBindRequest): {
-    chainId: bigint;
-    chainIdStr: string;
-    registry: Hex;
-    account: Hex;
-    pubSignals: bigint[];
-    userContextData: Hex;
-    selfDestChainId: bigint;
-  } {
-    // ── Pull pinned values from env ─────────────────────────────
-    const chainIdStr = this.env.BASE_CHAIN_ID;
-    if (!/^\d+$/.test(chainIdStr)) {
-      throw new AttesterError(
-        'BAD_CHAIN_ID_VAR',
-        `BASE_CHAIN_ID var is malformed: ${chainIdStr}`,
-      );
-    }
-    const chainId = BigInt(chainIdStr);
-
-    const allowedRegistryRaw = this.env.NULLIFIER_REGISTRY_ADDRESS;
-    if (!isAddress(allowedRegistryRaw)) {
-      throw new AttesterError(
-        'BAD_REGISTRY_VAR',
-        `NULLIFIER_REGISTRY_ADDRESS var is malformed: ${allowedRegistryRaw}`,
-      );
-    }
-    const allowedRegistry = getAddress(allowedRegistryRaw);
-
-    // ── Validate request shape ──────────────────────────────────
-    if (!req || typeof req !== 'object') {
-      badRequest('BAD_REQUEST', 'request body is missing or not an object');
-    }
-    if (typeof req.registry !== 'string' || !isAddress(req.registry)) {
-      badRequest('BAD_REGISTRY', 'request.registry is not a valid address');
-    }
-    if (typeof req.account !== 'string' || !isAddress(req.account)) {
-      badRequest('BAD_ACCOUNT', 'request.account is not a valid address');
-    }
-    const requestedRegistry = getAddress(req.registry);
-    const requestedAccount = getAddress(req.account);
-
-    // ── Pinned-registry allowlist (defense-in-depth) ────────────
-    if (requestedRegistry !== allowedRegistry) {
-      badRequest(
-        'REGISTRY_NOT_ALLOWED',
-        `attester refuses to sign for registry ${requestedRegistry}; ` +
-          `pinned registry is ${allowedRegistry}`,
-      );
-    }
-
-    const pubSignals = parsePubSignals(req.pubSignals);
-
-    // ── Cross-field consistency (cheap pre-flight) ──────────────
-    // The on-chain registry already enforces these; doing it here
-    // turns a confusing revert on-chain into a clear off-chain error
-    // before we waste gas.
-    //
-    // NOTE: pubSignals[USER_IDENTIFIER] is NOT uint160(account). Self
-    // emits ripemd160(sha256(userContextData)), so the only way to tie
-    // the proof to `account` is to recompute that commitment and then
-    // inspect the id embedded in the preimage. Comparing the signal to
-    // the address directly rejects every genuine proof.
-    const userContextData = req.userContextData;
-    if (typeof userContextData !== 'string' || !/^0x[0-9a-fA-F]*$/.test(userContextData)) {
-      badRequest(
-        'BAD_USER_CONTEXT_FORMAT',
-        'userContextData must be a 0x-prefixed hex string',
-      );
-    }
-
-    let decoded: DecodedUserContext;
-    try {
-      decoded = decodeUserContextData(userContextData);
-    } catch (err) {
-      badRequest(
-        'BAD_USER_CONTEXT_LENGTH',
-        err instanceof Error ? err.message : 'userContextData is malformed',
-      );
-    }
-
-    if (getAddress(decoded.userId) !== getAddress(requestedAccount)) {
-      badRequest(
-        'USER_IDENTIFIER_MISMATCH',
-        `userContextData names ${decoded.userId}, not the requested account ${requestedAccount}`,
-      );
-    }
-
-    const expectedUserIdentifier = calculateUserIdentifierHash(userContextData);
-    const userIdentifier = pubSignals[PUB_SIGNAL_INDEX.USER_IDENTIFIER]!;
-    if (userIdentifier !== expectedUserIdentifier) {
-      badRequest(
-        'USER_IDENTIFIER_COMMITMENT_MISMATCH',
-        `pubSignals[USER_IDENTIFIER] (${userIdentifier}) does not match the ` +
-          `commitment over userContextData (${expectedUserIdentifier})`,
-      );
-    }
-
-    return {
-      chainId,
-      chainIdStr,
-      registry: requestedRegistry,
-      account: requestedAccount,
-      pubSignals,
-      userContextData,
-      selfDestChainId: decoded.destChainId,
-    };
-  }
-
-  async #signPrepared(
-    prepared: {
-      chainId: bigint;
-      chainIdStr: string;
-      registry: Hex;
-      account: Hex;
-      pubSignals: bigint[];
-      userContextData: Hex;
-      selfDestChainId: bigint;
-    },
-    audit: { kind: string; extra?: Record<string, unknown> },
-  ): Promise<SignBindResponse> {
-    const { chainId, chainIdStr, registry, account, pubSignals, userContextData } =
-      prepared;
+  async #signPrepared(prepared: PreparedBind, celo: CeloGateResult): Promise<SignBindResponse> {
+    const { chainId, chainIdStr, registry, account, pubSignals, userContextData } = prepared;
 
     assertPrivateKey(this.env.ATTESTER_PRIVATE_KEY);
     const signed = await signBindAttestation(this.env.ATTESTER_PRIVATE_KEY, {
@@ -396,29 +157,26 @@ export default class CofferdamAttester
       pubSignals,
     });
 
-    // ── Audit log ───────────────────────────────────────────────
-    // Privacy-safe: account + registry + chainId + attestationId +
-    // scope + nullifier (the nullifier is already public on bind,
-    // so logging it here is equivalent in linkability). We do NOT
-    // log the full pubSignals (could include packed birth-year
-    // disclosure data depending on Self circuit version).
+    // Privacy-safe audit line: the nullifier is public on bind anyway, so
+    // logging it here adds no linkability. Full pubSignals are NOT logged —
+    // the revealed-data words can carry disclosure fields.
     console.log(
       JSON.stringify({
-        kind: audit.kind,
+        kind: 'attester.signBind',
         environment: this.env.ENVIRONMENT,
         chainId: chainIdStr,
         registry,
         account,
-        attestationId: pubSignals[PUB_SIGNAL_INDEX.ATTESTATION_ID]!.toString(),
-        scope: pubSignals[PUB_SIGNAL_INDEX.SCOPE]!.toString(),
-        nullifier: pubSignals[PUB_SIGNAL_INDEX.NULLIFIER]!.toString(),
+        attestationId: pubSignals[PASSPORT_DISCLOSE_INDEX.ATTESTATION_ID]!.toString(),
+        scope: pubSignals[PASSPORT_DISCLOSE_INDEX.SCOPE]!.toString(),
+        nullifier: prepared.nullifier.toString(),
         attesterAddress: signed.attesterAddress,
         messageHash: signed.messageHash,
-        // Self's declared destination chain, folded into the
-        // userIdentifier commitment. Must match the registry's
-        // `selfDestChainId` immutable or the bind reverts on-chain.
-        selfDestChainId: prepared.selfDestChainId.toString(),
-        ...audit.extra,
+        gate: 'celo',
+        celoChainId: celo.chainId.toString(),
+        celoRegistry: celo.registry,
+        merkleRoot: celo.merkleRoot.toString(),
+        proofDate: celo.proofDate,
       }),
     );
 
@@ -430,141 +188,24 @@ export default class CofferdamAttester
       registry,
       account,
       userContextData,
+      gate: 'celo',
+      celo: {
+        chainId: celo.chainId.toString(),
+        registry: celo.registry,
+        merkleRoot: celo.merkleRoot.toString(),
+        proofDate: celo.proofDate,
+      },
     };
   }
 
   /**
-   * Issue a short-lived JWT pairing a prover request to a specific
-   * (account, registry) combo.
-   *
-   * The caller verifies this JWT locally via the same HS256 shared
-   * secret and rejects any request whose Authorization header doesn't
-   * carry a valid, unexpired token with matching claims.
-   *
-   * Hot-path constraints:
-   *   - No on-chain reads. The registry-allowlist gate is the same
-   *     deploy-time constant the `signBind` path uses.
-   *   - No ATTESTER_PRIVATE_KEY access. JWT signing uses
-   *     JWT_SHARED_SECRET; the ECDSA key stays cold on this code path.
-   *   - Audit-log line is privacy-equivalent to the signBind log:
-   *     account + registry + exp, no claims beyond what consumers
-   *     can already correlate from the on-chain bind tx.
-   */
-  async issueProverSession(
-    req: IssueProverSessionRequest,
-  ): Promise<IssueProverSessionResponse> {
-    // ── Validate the request shape ──────────────────────────────
-    if (!req || typeof req !== 'object') {
-      badRequest('BAD_REQUEST', 'request body is missing or not an object');
-    }
-    if (typeof req.registry !== 'string' || !isAddress(req.registry)) {
-      badRequest('BAD_REGISTRY', 'request.registry is not a valid address');
-    }
-    if (typeof req.account !== 'string' || !isAddress(req.account)) {
-      badRequest('BAD_ACCOUNT', 'request.account is not a valid address');
-    }
-    const requestedRegistry = getAddress(req.registry);
-    const requestedAccount = getAddress(req.account);
-
-    // ── Pinned-registry allowlist (same gate as signBind) ───────
-    const allowedRegistryRaw = this.env.NULLIFIER_REGISTRY_ADDRESS;
-    if (!isAddress(allowedRegistryRaw)) {
-      throw new AttesterError(
-        'BAD_REGISTRY_VAR',
-        `NULLIFIER_REGISTRY_ADDRESS var is malformed: ${allowedRegistryRaw}`,
-      );
-    }
-    const allowedRegistry = getAddress(allowedRegistryRaw);
-    if (requestedRegistry !== allowedRegistry) {
-      badRequest(
-        'REGISTRY_NOT_ALLOWED',
-        `attester refuses to issue a prover session for registry ${requestedRegistry}; ` +
-          `pinned registry is ${allowedRegistry}`,
-      );
-    }
-
-    // ── Resolve the JWT shape from env ──────────────────────────
-    const issuer = this.env.JWT_ISSUER;
-    const audience = this.env.JWT_AUDIENCE;
-    if (typeof issuer !== 'string' || issuer.length === 0) {
-      throw new AttesterError('BAD_JWT_ISSUER_VAR', 'JWT_ISSUER var is missing');
-    }
-    if (typeof audience !== 'string' || audience.length === 0) {
-      throw new AttesterError('BAD_JWT_AUDIENCE_VAR', 'JWT_AUDIENCE var is missing');
-    }
-
-    const ttlRaw = this.env.PROVER_SESSION_TTL_SECONDS;
-    if (!/^\d+$/.test(ttlRaw)) {
-      throw new AttesterError(
-        'BAD_JWT_TTL_VAR',
-        `PROVER_SESSION_TTL_SECONDS var is malformed: ${ttlRaw}`,
-      );
-    }
-    const ttlSeconds = Number(ttlRaw);
-    if (ttlSeconds < 1 || ttlSeconds > 3600) {
-      throw new AttesterError(
-        'BAD_JWT_TTL_RANGE',
-        `PROVER_SESSION_TTL_SECONDS must be 1..3600, got ${ttlSeconds}`,
-      );
-    }
-
-    // ── Validate the shared secret ──────────────────────────────
-    const secretRaw = this.env.JWT_SHARED_SECRET;
-    if (typeof secretRaw !== 'string' || secretRaw.length < 32) {
-      throw new AttesterError(
-        'BAD_JWT_SECRET',
-        'JWT_SHARED_SECRET secret is missing or too short (≥32 chars required)',
-      );
-    }
-
-    // ── Sign the JWT ────────────────────────────────────────────
-    const iat = Math.floor(Date.now() / 1000);
-    const exp = iat + ttlSeconds;
-    const key = new TextEncoder().encode(secretRaw);
-
-    const jwt = await new SignJWT({ registry: requestedRegistry })
-      .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
-      .setIssuer(issuer)
-      .setAudience(audience)
-      .setSubject(requestedAccount)
-      .setIssuedAt(iat)
-      .setNotBefore(iat)
-      .setExpirationTime(exp)
-      .sign(key);
-
-    // ── Audit log ───────────────────────────────────────────────
-    // No secrets / no JWT body / no nullifier. The (account, registry,
-    // exp) tuple is sufficient for replay-reconciliation against the
-    // caller's request log in Workers Logs.
-    console.log(
-      JSON.stringify({
-        kind: 'attester.issueProverSession',
-        environment: this.env.ENVIRONMENT,
-        account: requestedAccount,
-        registry: requestedRegistry,
-        exp,
-        ttlSeconds,
-      }),
-    );
-
-    return {
-      jwt,
-      exp,
-      account: requestedAccount,
-      registry: requestedRegistry,
-    };
-  }
-
-  /**
-   * Non-RPC fetch handler. The Worker is service-binding only, but
-   * Cloudflare requires `default export.fetch` to exist; returning
-   * 405 makes the boundary explicit if anyone ever flips
-   * `workers_dev: true` by accident.
+   * Non-RPC fetch handler. The Worker is service-binding only, but a default
+   * export needs `fetch`; 405 makes the boundary explicit if `workers_dev`
+   * is ever flipped by accident.
    */
   override async fetch(): Promise<Response> {
-    return new Response(
-      'cofferdam-attester is service-binding-only; use the ATTESTER RPC',
-      { status: 405 },
-    );
+    return new Response('cofferdam-attester is service-binding-only; use the ATTESTER RPC', {
+      status: 405,
+    });
   }
 }

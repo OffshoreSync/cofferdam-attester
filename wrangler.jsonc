@@ -1,11 +1,12 @@
 /**
  * Cofferdam Self attester Worker — Cloudflare config.
  *
- * Holds the SelfAttester ECDSA private key as a Cloudflare-managed
- * secret and signs bind messages on demand. Strictly service-binding
- * only — `workers_dev: false` and zero `routes`. The only callers are
- * `cofferdam-api` (today) and `cofferdam-prover` (Sessions 4-5),
- * both bound via `services` in their respective wrangler.jsonc.
+ * Holds the SelfAttester ECDSA private key as a Cloudflare-managed secret and
+ * signs bind messages for `NullifierRegistry` on Base, after re-verifying the
+ * proof's Celo-anchored facts against Self's registry (decision 0004).
+ * Strictly service-binding only — `workers_dev: false` and zero `routes`.
+ * The only caller is `cofferdam-api`, bound via `services` in its own
+ * wrangler.jsonc.
  *
  * Schema reference: https://developers.cloudflare.com/workers/wrangler/configuration/
  */
@@ -16,103 +17,68 @@
   "compatibility_date": "2026-05-30",
   "compatibility_flags": ["nodejs_compat"],
 
-  // Observability — tail-able logs are the audit trail for every
-  // sign event. Free tier, 7-day retention; Logpush in production.
+  // Observability — tail-able logs are the audit trail for every sign and
+  // every gate rejection. Free tier, 7-day retention; Logpush in production.
   "observability": {
     "enabled": true
   },
 
   // ── PRIVATE WORKER ──────────────────────────────────────────────
-  // No public *.workers.dev URL. No routes. The only way to invoke
-  // this Worker is via the `services` binding from another Worker
-  // in the same Cloudflare account. Belt-and-suspenders defense for
-  // the attester key — even a compromised cofferdam-api can only
-  // call the exposed RPC method, never extract the secret.
+  // No public *.workers.dev URL. No routes. The only way to invoke this
+  // Worker is the `services` binding from another Worker in the same
+  // Cloudflare account. Even a compromised cofferdam-api can only call the
+  // exposed RPC method, never extract the secret.
   "workers_dev": false,
 
-  // Variables — non-secret. Pinned so the attester refuses to sign
-  // for the wrong NullifierRegistry / chain (defense against an
-  // attacker tricking the attester into signing a hash bound to a
-  // different registry on a different chain).
+  // Variables — non-secret. Pinned so the attester refuses to sign for the
+  // wrong registry, the wrong Base chain, or against the wrong Celo.
   "vars": {
     "ENVIRONMENT": "development",
 
-    // Base Sepolia chain id. Hardcoded into the message-hash
-    // preimage; if mainnet ever lights up we deploy a separate
-    // attester Worker (cofferdam-attester-mainnet) instead of
-    // multiplexing across chains in a single signer.
-    // Base mainnet would be "8453".
+    // Base Sepolia chain id, part of the signed preimage. Base mainnet
+    // ("8453") gets its own attester Worker deploy rather than a second
+    // value on this one.
     "BASE_CHAIN_ID": "84532",
 
-    // ── Self bind gate (staged) ─────────────────────────────────
-    // 'attestation' — verify the Self enclave's GCP Confidential
-    //                 Space attestation, then trust the caller's
-    //                 pubSignals. TESTNET ONLY: the attestation
-    //                 binds the TEE's ECDH channel, which is minted
-    //                 during the handshake BEFORE the proof exists,
-    //                 so it cannot vouch for the accompanying
-    //                 nullifier. A patched app can pair a genuine
-    //                 attestation with a fabricated nullifier.
-    // 'celo'        — re-verify the Groth16 proof + identity
-    //                 commitment root against Self's registry on
-    //                 Celo via eth_call. Required before mainnet.
-    //
-    // The Worker hard-fails `signBindWithAttestation` whenever
-    // ENVIRONMENT is "production", regardless of this value.
-    "BIND_GATE_MODE": "attestation",
-
-    // Allowlisted Self proving-enclave image measurements — sha256
-    // hex of `submods.container.image_digest` from the attestation
-    // JWT. Comma/whitespace separated; the `sha256:` prefix is
-    // optional. Self calls this "PCR0" (legacy AWS Nitro naming;
-    // their TEE is GCP Confidential Space, not Nitro) and keeps the
-    // canonical list on-chain in PCR0Manager
-    // 0xE36d4EE5Fd3916e703A46C21Bb3837dB7680C8B8 on Celo.
-    //
-    // Empty is tolerated ONLY when ENVIRONMENT=development, which
-    // also relaxes the `dbgstat` debug-disabled requirement. Before
-    // staging, populate this by capturing the digest from a real
-    // device run — see docs/SELF_SMOKE_TEST.md.
-    "SELF_TEE_IMAGE_DIGESTS": "",
-
-    // Sole NullifierRegistry the attester is willing to sign for.
-    // Single-element allowlist for α; on rotation, deploy a new
-    // attester Worker pointing at the new registry, then flip the
-    // SelfAttesterRegistry trust set on-chain.
-    //
-    // MUST stay identical to `SEPOLIA_DEPLOYMENTS.NullifierRegistry` in
-    // cofferdam-api/src/chain/deployments.ts — any divergence makes `signBind`
-    // reject every call with REGISTRY_NOT_ALLOWED. (These two drifted before,
-    // which silently broke /v1/attester/test-sign.)
+    // Sole NullifierRegistry the attester signs for. MUST stay identical to
+    // `SEPOLIA_DEPLOYMENTS.NullifierRegistry` in
+    // cofferdam-api/src/chain/deployments.ts — divergence makes `signBind`
+    // reject every call with REGISTRY_NOT_ALLOWED (it drifted once before).
     //
     // This registry pins expectedScope = Poseidon(cofferdam.xyz ×
     // cofferdam-bind-v1) and selfDestChainId = 42220, both immutable.
     // Requires ATTESTER_PRIVATE_KEY to be the key for
     // 0x2dFDdE621680A270cC01E8D9D729f25a46Bdae59, the sole attester trusted by
-    // SelfAttesterRegistry 0x8F3fF40Aa7Eb46b9AB214229D8f7833bbC47ae08.
-    // That key lives in TWO places that rotations must both update: the
-    // Cloudflare secret (deployed) and .dev.vars (local `wrangler dev`).
-    // Rotate with base-contracts/scripts/rotate-self-attester.ts.
+    // SelfAttesterRegistry 0x8F3fF40Aa7Eb46b9AB214229D8f7833bbC47ae08. That
+    // key lives in TWO places a rotation must both update: the Cloudflare
+    // secret (deployed) and .dev.vars (local `wrangler dev`). Rotate with
+    // base-contracts/scripts/rotate-self-attester.ts.
     "NULLIFIER_REGISTRY_ADDRESS": "0x2843F55C9E1491a6d47F65f041E68F96E3aeB3d4",
 
-    // ── JWT issuance (Session 4 NEW — for cofferdam-prover) ─────
-    // The `issueProverSession` RPC returns a short-lived HS256 JWT
-    // that the cofferdam-prover Worker verifies locally with the same
-    // shared secret. iss/aud values must match cofferdam-prover's
-    // own JWT_ISSUER/JWT_AUDIENCE vars; TTL controls replay window.
-    "JWT_ISSUER": "cofferdam-attester",
-    "JWT_AUDIENCE": "cofferdam-prover",
-    "PROVER_SESSION_TTL_SECONDS": "60"
+    // ── Celo bind gate ──────────────────────────────────────────
+    // Self.xyz anchors its identity-commitment tree and OFAC roots on Celo
+    // mainnet. Before signing, the attester confirms over read-only
+    // eth_call that the proof's Merkle root is one Self published, that its
+    // OFAC roots are current, and that the hub still routes E_PASSPORT to
+    // the pinned registry. These four pins change only when Self migrates
+    // contracts; verify against self/common/src/constants/constants.ts and
+    // `hub.registry(bytes32(1))` before editing.
+    //
+    // CELO_RPC_URL is a var because forno is public. Moving to a keyed
+    // provider means deleting this var and `wrangler secret put CELO_RPC_URL`.
+    "CELO_RPC_URL": "https://forno.celo.org",
+    // Must equal `SelfApp.chainID` in the app and the registry's
+    // selfDestChainId immutable. Self staging (Celo Sepolia 11142220) cannot
+    // be used with the current registry.
+    "SELF_CELO_CHAIN_ID": "42220",
+    // IdentityVerificationHubImplV2 proxy (IDENTITY_VERIFICATION_HUB_ADDRESS).
+    "SELF_HUB_ADDRESS": "0xe57F4773bd9c9d8b6Cd70431117d353298B9f5BF",
+    // IdentityRegistryImplV1 proxy for E_PASSPORT, as `hub.registry(bytes32(1))`
+    // reports it (checked live 2026-10-10).
+    "SELF_PASSPORT_REGISTRY_ADDRESS": "0x37F5CB8cB1f6B00aa768D8aA99F1A9289802A968"
   }
 
   // Secrets — set via `wrangler secret put`. NOT in this file.
-  //   ATTESTER_PRIVATE_KEY  — 0x-prefixed 32-byte secp256k1 key.
-  //                           Recover address: 0x... (must match the
-  //                           address registered in SelfAttesterRegistry).
-  //   JWT_SHARED_SECRET     — ≥32 bytes of base64url-encoded random
-  //                           bytes; MUST equal the same-named secret
-  //                           in cofferdam-prover. Provision via:
-  //                             openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
-  //                             wrangler secret put JWT_SHARED_SECRET
-  //                           (run in both Workers' repos).
+  //   ATTESTER_PRIVATE_KEY  — 0x-prefixed 32-byte secp256k1 key whose address
+  //                           is allow-listed in SelfAttesterRegistry.
 }

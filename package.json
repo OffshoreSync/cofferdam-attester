@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Cofferdam Self attester Worker — holds the registered SelfAttester ECDSA key as a Cloudflare-managed secret, signs bind messages over Workers RPC. Service-binding only, no public URL.",
+  "description": "Cofferdam Self attester Worker — holds the registered SelfAttester ECDSA key as a Cloudflare-managed secret and signs bind messages over Workers RPC after re-verifying the proof against Self.xyz's registry on Celo. Service-binding only, no public URL.",
   "license": "Apache-2.0",
   "author": "Cofferdam Inc",
   "homepage": "https://github.com/cofferdamxyz/cofferdam-attester#readme",
@@ -18,16 +18,18 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "cf-typegen": "wrangler types"
   },
   "dependencies": {
-    "jose": "5.9.6",
     "viem": "2.51.3"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "4.20260530.1",
     "@types/node": "26.2.0",
     "typescript": "5.9.3",
+    "vitest": "4.1.6",
     "wrangler": "4.95.0"
   }
 }
