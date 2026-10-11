@@ -129,6 +129,7 @@ yarn install
 # Set the attester private key as a local-dev secret. Stored in
 # `.dev.vars` (already git-ignored).
 echo "ATTESTER_PRIVATE_KEY=0x<paste-from-1Password>" > .dev.vars
+echo "ENVIRONMENT=development" >> .dev.vars   # the deployed Worker runs staging
 
 yarn dev
 # wrangler dev binds on a high port, prints the local-registry URL.

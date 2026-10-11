@@ -33,7 +33,9 @@
   // Variables — non-secret. Pinned so the attester refuses to sign for the
   // wrong registry, the wrong Base chain, or against the wrong Celo.
   "vars": {
-    "ENVIRONMENT": "development",
+    // Deployed value; local `wrangler dev` overrides it to "development" via
+    // .dev.vars. The attester only logs it — the Celo gate is unconditional.
+    "ENVIRONMENT": "staging",
 
     // Base Sepolia chain id, part of the signed preimage. Base mainnet
     // ("8453") gets its own attester Worker deploy rather than a second
